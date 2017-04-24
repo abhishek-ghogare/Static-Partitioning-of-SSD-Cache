@@ -6,4 +6,9 @@ dmsetup create home-cached --table '0 209715200 cache /dev/mapper/ssd-metadata /
 #echo y | mkfs.ext4 /dev/mapper/home-cached
 mount /dev/mapper/home-cached /mnt/cache
 
+echo "12" > /proc/smqp_file_track_list
+echo "15" > /proc/smqp_file_track_list
+
+cat /proc/smqp_file_track_list
+
 

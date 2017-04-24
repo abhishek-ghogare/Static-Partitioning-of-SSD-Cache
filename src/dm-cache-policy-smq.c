@@ -15,6 +15,15 @@
 #include <linux/vmalloc.h>
 #include <linux/math64.h>
 
+#include <linux/proc_fs.h>
+#include <linux/string.h>
+#include <linux/uaccess.h>
+#include <linux/ctype.h>
+#include <linux/path.h>
+#include <linux/namei.h>
+#include <linux/fs.h>
+#include <linux/namei.h>
+
 #define DM_MSG_PREFIX "cache-policy-smq"
 
 /*----------------------------------------------------------------*/
@@ -448,8 +457,6 @@ struct stats {
 	unsigned hit_threshold;
 	unsigned hits;
 	unsigned misses;
-	unsigned part1_count;
-	unsigned part2_count;
 };
 
 enum performance {
@@ -719,14 +726,15 @@ struct block_to_inode_node {
 	dm_oblock_t block;
 	long unsigned int inode_num;
 
-	struct hlist_node hnode;
+	struct hlist_node node;
 };
-/*
-struct inode_list {
-	struct inode * i;
-	struct block_list head;
-	struct list_head *node;
-};*/
+struct file_track_list_node {
+	char filename[200];
+	unsigned long inode_no;
+	unsigned long cache_block_count;
+
+	struct list_head node;
+};
 
 /*----------------------------------------------------------------*/
 
@@ -773,7 +781,8 @@ struct smq_policy {
 	struct queue clean;
 	struct queue dirty;
 
-	struct list_head inode_list_head;
+	struct list_head file_track_list;
+	int file_track_nr;
 	DECLARE_HASHTABLE(block_to_inode, BLOCK_TO_INODE_BITS);
 
 
@@ -807,19 +816,20 @@ struct smq_policy {
 	unsigned long next_cache_period;
 };
 
-/*----------------------------------------------------------------*/
-/*struct inode_list * get_inode_list_node(struct smq_policy *mq, unsigned long inode_num) {
-    struct list_head *ptr;
-    struct inode_list *inode_list_node;
+struct smq_policy *global_smq = NULL;
 
-	list_for_each(ptr, &mq->inode_list_head) {
-		inode_list_node = list_entry(ptr, struct inode_list, node);
-		if(inode_list_node->i->i_ino == inode_num)
-			return inode_list_node;
+/*----------------------------------------------------------------*/
+struct file_track_list_node * get_file_track_list_node_from_inode(struct smq_policy *mq, unsigned long inode_num) {
+    struct file_track_list_node *node1;
+
+	list_for_each_entry(node1, &mq->file_track_list, node) {
+		if(node1->inode_no == inode_num) {
+			return node1;
+		}
 	}
 
 	return NULL;
-}*/
+}
 
 static unsigned long get_inode_from_bio(struct bio *bio) {
 	unsigned long inode = 0;
@@ -835,12 +845,128 @@ static struct block_to_inode_node *get_hlist_node_from_block(struct smq_policy *
 	//DEFINE_HASHTABLE(block_to_inode, BLOCK_TO_INODE_BITS);
 	struct block_to_inode_node *bi_node;
 	//hash_for_each_possible(hlist, bi_node, hnode, oblock)
-	hash_for_each_possible(mq->block_to_inode, bi_node, hnode, oblock)
+	hash_for_each_possible(mq->block_to_inode, bi_node, node, oblock)
 		if(bi_node->block == oblock)
 			return bi_node;
 
 	return NULL;
 }
+
+/* lock for procfs write access */
+static DEFINE_MUTEX(write_lock);
+/* lock for procfs read access */
+static DEFINE_MUTEX(read_lock);
+
+char *trimwhitespace(char *str)
+{
+  char *end;
+
+  // Trim leading space
+  while(isspace((unsigned char)*str)) str++;
+
+  if(*str == 0)  // All spaces?
+    return str;
+
+  // Trim trailing space
+  end = str + strlen(str) - 1;
+  while(end > str && isspace((unsigned char)*end)) end--;
+
+  // Write new null terminator
+  *(end+1) = 0;
+
+  return str;
+}
+static ssize_t fifo_write(struct file *file, const char __user *buf,
+						size_t count, loff_t *ppos)
+{
+	char filename[800];
+	char *filename_trimmed = NULL;
+	int duplecate_request = 0;
+	struct file_track_list_node *node1 = NULL;
+
+    //struct path path;
+
+	if (mutex_lock_interruptible(&write_lock))
+		return -ERESTARTSYS;
+
+	copy_from_user(filename, buf, count);
+	filename[count] = '\0';
+	filename_trimmed = trimwhitespace(filename);
+
+	printk(KERN_ERR "writing to file : %s\n", filename_trimmed);
+
+	list_for_each_entry(node1, &global_smq->file_track_list, node) {
+		if(strcmp(node1->filename,filename_trimmed) == 0) {
+			printk(KERN_ERR "File exists %s\n", filename_trimmed);
+			duplecate_request = 1;
+			break;
+		}
+	}
+
+	if(!duplecate_request) {
+	    //kern_path(filename_trimmed, LOOKUP_FOLLOW, &path);
+	    //path_lookup(filename_trimmed, LOOKUP_FOLLOW, &nd);
+	    //inode = nd.inode;
+
+		node1 = (struct file_track_list_node *) kmalloc(sizeof(struct file_track_list_node), GFP_KERNEL);
+		strcpy(node1->filename, filename_trimmed);
+		node1->cache_block_count = 0;
+		//node1->inode_no = path.dentry->d_inode->i_ino;
+		sscanf(filename, "%lu", &node1->inode_no);
+		INIT_LIST_HEAD(&node1->node);
+		list_add(&node1->node, &global_smq->file_track_list);
+		global_smq->file_track_nr++;
+		printk(KERN_ERR "Added to list %s\n", node1->filename);
+	}
+
+	mutex_unlock(&write_lock);
+
+	return count;
+}
+
+#define ON 1
+#define OFF 0
+static ssize_t fifo_read(struct file *file, char __user *buf,
+						size_t count, loff_t *ppos)
+{
+	char filenames[800] = "";
+	struct file_track_list_node *node1 = NULL;
+	static int alternate = ON;
+
+	if (alternate%2 == ON) {
+		if (mutex_lock_interruptible(&read_lock))
+			return -ERESTARTSYS;
+
+		list_for_each_entry(node1, &global_smq->file_track_list, node) {
+			sprintf(filenames+strlen(filenames), "inode:%lu\t", node1->inode_no);
+			strcat(filenames, node1->filename);
+			strcat(filenames, "\n");
+		}
+
+		printk(KERN_ERR "All reading from file : %s\n", filenames);
+
+		copy_to_user(buf, filenames, strlen(filenames));
+
+		mutex_unlock(&read_lock);
+
+		alternate = OFF;
+
+		return strlen(filenames);
+	}
+	else {
+		alternate = ON;
+		return 0;
+	}
+}
+
+static const struct file_operations fifo_reader_fops = {
+	.owner		= THIS_MODULE,
+	.read		= fifo_read,
+	.write		= fifo_write,
+	.llseek		= noop_llseek,
+};
+
+
 
 /*
  * Return the oldest entry of the lowest populated level.
@@ -857,11 +983,15 @@ struct entry *q_peek(struct queue *q, unsigned max_level, bool can_cross_sentine
 			if(bio && mq) {
 				struct block_to_inode_node *bi_node = get_hlist_node_from_block(mq, e->oblock);
 				if(bi_node) {
-					if(bi_node->inode_num != get_inode_from_bio(bio)){
-						//printk(KERN_ERR "Inside q_peek : inode : %lu\t not eq %lu\n", get_inode_from_bio(bio), bi_node->inode_num);
-						continue;
-					} else {
+					unsigned long inode_no = bi_node->inode_num;
+					struct file_track_list_node *ftnode = get_file_track_list_node_from_inode(mq, inode_no);
+					unsigned long cache_block_count = ftnode->cache_block_count;
+
+					if((mq->file_track_nr > 0 && cache_block_count > mq->cache_size / mq->file_track_nr) || bi_node->inode_num == get_inode_from_bio(bio)) {
 						printk(KERN_ERR "Inside q_peek : inode : %lu\t  is eq %lu\n", get_inode_from_bio(bio), bi_node->inode_num);
+					} else {
+						//printk(KERN_ERR "Inside q_peek CONTINUE : inode : %lu\t not eq %lu\n", get_inode_from_bio(bio), bi_node->inode_num);
+						continue;
 					}
 				}
 			}
@@ -869,13 +999,16 @@ struct entry *q_peek(struct queue *q, unsigned max_level, bool can_cross_sentine
 			if (e->sentinel) {
 				if (can_cross_sentinel)
 					continue;
-				else
+				else {
 					break;
+				}
 			}
 
+			//printk(KERN_ERR "Inside q_peek RETURN : inode : %lu\n", get_inode_from_bio(bio));
 			return e;
 		}
 
+	//printk(KERN_ERR "Inside q_peek RETURN NULL : inode : %lu\n", get_inode_from_bio(bio));
 	return NULL;
 }
 /*
@@ -1174,6 +1307,7 @@ static int demote_cblock(struct smq_policy *mq,
 			 dm_oblock_t *oblock, struct bio *bio)
 {
 	struct block_to_inode_node *bi_node = NULL;
+	struct file_track_list_node *ftnode = NULL;
 	struct entry *demoted = q_peek(&mq->clean, mq->clean.nr_levels, false, bio, mq);
 	if (!demoted)
 		/*
@@ -1198,11 +1332,13 @@ static int demote_cblock(struct smq_policy *mq,
 	// Remove block inode mapping
 	bi_node = get_hlist_node_from_block(mq, demoted->oblock);
 	if(bi_node) {
-		printk(KERN_ERR "Inside demote_cblock : inode : %lu\t->%lu\t\tREPLACE \t Stats : part1 count : %u \tpart2 count : %u\n", get_inode_from_bio(bio), bi_node->inode_num, mq->cache_stats.part1_count, mq->cache_stats.part2_count);
-		if(bi_node) {
-			hlist_del(&bi_node->hnode);
-			kfree(bi_node);
+		ftnode = get_file_track_list_node_from_inode(mq, bi_node->inode_num);
+		if(ftnode) {
+			ftnode->cache_block_count--;
 		}
+		printk(KERN_ERR "Inside demote_cblock : inode : %lu\t->%lu\t\tREPLACE\n", get_inode_from_bio(bio), bi_node->inode_num);
+		hlist_del(&bi_node->node);
+		kfree(bi_node);
 	}
 
 	return 0;
@@ -1225,6 +1361,8 @@ static enum promote_result maybe_promote(bool promote)
 static enum promote_result should_promote(struct smq_policy *mq, struct entry *hs_e, struct bio *bio,
 					  bool fast_promote)
 {
+	return PROMOTE_PERMANENT;
+
 	if (bio_data_dir(bio) == WRITE) {
 		if (!allocator_empty(&mq->cache_alloc) && fast_promote)
 			return PROMOTE_TEMPORARY;
@@ -1242,6 +1380,7 @@ static void insert_in_cache(struct smq_policy *mq, dm_oblock_t oblock,
 	int r;
 	struct entry *e;
 	struct block_to_inode_node *binode = NULL;
+	struct file_track_list_node *ftnode = NULL;
 
 	//printk(KERN_ERR "Entered in insert_in_cache\n");
 
@@ -1263,6 +1402,9 @@ static void insert_in_cache(struct smq_policy *mq, dm_oblock_t oblock,
 	BUG_ON(!e);
 	e->oblock = oblock;
 
+
+
+
 	// Add block inode mapping
 	// TODO:: what if mem is not allocatd here below, would have allocated already
 	binode = get_hlist_node_from_block(mq, e->oblock);
@@ -1273,10 +1415,18 @@ static void insert_in_cache(struct smq_policy *mq, dm_oblock_t oblock,
 			result->op = POLICY_MISS;
 			return;
 		}
-		binode->block = oblock;
-		binode->inode_num = get_inode_from_bio(bio);
-		INIT_HLIST_NODE(&binode->hnode);
-		hash_add(mq->block_to_inode, &binode->hnode, oblock);
+		//binode->block = oblock;
+		//binode->inode_num = get_inode_from_bio(bio);
+		INIT_HLIST_NODE(&binode->node);
+		hash_add(mq->block_to_inode, &binode->node, oblock);
+	}
+	binode->block = oblock;
+	binode->inode_num = get_inode_from_bio(bio);
+
+	// Increment cache count of corresponding file
+	ftnode = get_file_track_list_node_from_inode(mq, binode->inode_num);
+	if(ftnode) {
+		ftnode->cache_block_count++;
 	}
 
 	if (pr == PROMOTE_TEMPORARY)
@@ -1306,9 +1456,9 @@ static void insert_in_cache(struct smq_policy *mq, dm_oblock_t oblock,
 
 		//printk(KERN_ERR "Inside insert_in_cache : %llu\tREPLACE \t Stats : part1 count : %llu \tpart2 count : %llu\n", oblock, mq->cache_stats.part1_count, mq->cache_stats.part2_count);
 
-		printk(KERN_ERR "REPLACE\t: Inode: %lu\n", get_inode_from_bio(bio));
+		//printk(KERN_ERR "REPLACE\t: Inode: %lu\n", get_inode_from_bio(bio));
 
-		break;
+		//break;
 	case POLICY_NEW:/*
 		printk(KERN_ERR "Inside insert_in_cache : %llu\tNEW\n", oblock);
 		if(oblock < 102400)
@@ -1317,7 +1467,12 @@ static void insert_in_cache(struct smq_policy *mq, dm_oblock_t oblock,
 			mq->cache_stats.part2_count++;
 */
 		//printk(KERN_ERR "NEW\t: Stats : part1 count : %llu \tpart2 count : %llu\n", mq->cache_stats.part1_count, mq->cache_stats.part2_count);
-		printk(KERN_ERR "NEW\t: Inode: %lu\n", get_inode_from_bio(bio));
+		//printk(KERN_ERR "NEW\t: Inode: %lu\n", get_inode_from_bio(bio));
+
+		list_for_each_entry(ftnode, &mq->file_track_list, node) {
+			printk(KERN_ERR "New/Replace inode:%lu \t count:%lu \n", ftnode->inode_no, ftnode->cache_block_count);
+		}
+		//printk(KERN_ERR "New/Replace \n", get_inode_from_bio(bio));
 
 		break;
 	default:
@@ -1381,10 +1536,15 @@ static int map(struct smq_policy *mq, struct bio *bio, dm_oblock_t oblock,
 {
 	struct entry *e, *hs_e;
 	enum promote_result pr;
+	unsigned long inode_no;
+	struct file_track_list_node *ftnode;
 
 	//printk(KERN_INFO "SMQ Map block : %llu\n", oblock);
 
-	if(bio && get_inode_from_bio(bio) == 0) {
+	inode_no = get_inode_from_bio(bio);
+	ftnode = get_file_track_list_node_from_inode(mq, inode_no);
+
+	if(!ftnode || mq->file_track_nr <= 0 /* || ftnode->cache_block_count >= mq->cache_size / mq->file_track_nr*/) {
 		//printk(KERN_INFO "BIO from inode 0\n");
 		result->op = POLICY_MISS;
 		return -EWOULDBLOCK;
@@ -1770,6 +1930,8 @@ static void init_policy_functions(struct smq_policy *mq, bool mimic_mq)
 
 	// Initialise inode list
 	hash_init(mq->block_to_inode);
+	mq->file_track_nr = 0;
+	INIT_LIST_HEAD(&mq->file_track_list);
 }
 
 static bool too_many_hotspot_blocks(sector_t origin_size,
@@ -1878,6 +2040,8 @@ static struct dm_cache_policy *__smq_create(dm_cblock_t cache_size,
 	mq->next_hotspot_period = jiffies;
 	mq->next_cache_period = jiffies;
 
+	global_smq = mq;
+
 	return &mq->policy;
 
 bad_alloc_hotspot_table:
@@ -1960,6 +2124,10 @@ static int __init smq_init(void)
 		return -ENOMEM;
 	}
 
+	if (proc_create("smqp_file_track_list", 0, NULL, &fifo_reader_fops) == NULL) {
+		return -ENOMEM;
+	}
+
 	return 0;
 }
 
@@ -1968,6 +2136,7 @@ static void __exit smq_exit(void)
 	dm_cache_policy_unregister(&smq_policy_type);
 	dm_cache_policy_unregister(&mq_policy_type);
 	dm_cache_policy_unregister(&default_policy_type);
+	remove_proc_entry("smqp_file_track_list", NULL);
 }
 
 module_init(smq_init);

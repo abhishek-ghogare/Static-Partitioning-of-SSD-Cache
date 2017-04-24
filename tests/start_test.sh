@@ -11,18 +11,24 @@
 
 # 10G = 40960 blocks
 #RANGE=40960
-RANGE=2000
+RANGE1=200000
+RANGE2=2000
 count=40
-let "RANGE -= $count"
+let "RANGE1 -= $count"
+let "RANGE2 -= $count"
 
 for i in {1..200}
 do
-	number=$RANDOM
-	let "number %= $RANGE"
+	number1=$RANDOM
+	let "number1 %= $RANGE1"
+	number2=$RANDOM
+	let "number2 %= $RANGE2"
 
 	sync && echo 1 > /proc/sys/vm/drop_caches 
-	dd of=/dev/null if=/mnt/cache/fro1 bs=`echo 512*512 | bc` count=$count skip=$number
+	dd of=/dev/null if=/mnt/cache/fro1 bs=`echo 512*512 | bc` count=$count skip=$number1
 	sync && echo 1 > /proc/sys/vm/drop_caches
-	dd of=/dev/null if=/mnt/cache/fro2 bs=`echo 512*512 | bc` count=$count skip=$number
+	dd of=/dev/null if=/mnt/cache/fro2 bs=`echo 512*512 | bc` count=$count skip=$number2
+	sync && echo 1 > /proc/sys/vm/drop_caches
+	dd of=/dev/null if=/mnt/cache/fro3 bs=`echo 512*512 | bc` count=$count skip=$number2
 	sync && echo 1 > /proc/sys/vm/drop_caches
 done
