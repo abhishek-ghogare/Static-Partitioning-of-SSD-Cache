@@ -722,15 +722,16 @@ static struct entry *get_entry(struct entry_alloc *ea, unsigned index)
 
 /*----------------------------------------------------------------*/
 
-struct block_to_inode_node {
+#define BLOCK_TO_INODE_BITS 10
+struct blk_ino_pair {
 	dm_oblock_t block;
-	long unsigned int inode_num;
+	long unsigned int ino;
 
 	struct hlist_node node;
 };
-struct file_track_list_node {
+struct file_info {
 	char filename[200];
-	unsigned long inode_no;
+	unsigned long ino;
 	unsigned long cache_block_count;
 
 	struct list_head node;
@@ -747,7 +748,6 @@ struct file_track_list_node {
 #define HOTSPOT_UPDATE_PERIOD (HZ)
 #define CACHE_UPDATE_PERIOD (10u * HZ)
 
-#define BLOCK_TO_INODE_BITS 10
 struct smq_policy {
 	struct dm_cache_policy policy;
 
@@ -781,7 +781,7 @@ struct smq_policy {
 	struct queue clean;
 	struct queue dirty;
 
-	struct list_head file_track_list;
+	struct list_head file_info_list;
 	int file_track_nr;
 	DECLARE_HASHTABLE(block_to_inode, BLOCK_TO_INODE_BITS);
 
@@ -819,19 +819,19 @@ struct smq_policy {
 struct smq_policy *global_smq = NULL;
 
 /*----------------------------------------------------------------*/
-struct file_track_list_node * get_file_track_list_node_from_inode(struct smq_policy *mq, unsigned long inode_num) {
-    struct file_track_list_node *node1;
+struct file_info * get_finfo(struct smq_policy *mq, unsigned long inode_num) {
+    struct file_info *finfo;
 
-	list_for_each_entry(node1, &mq->file_track_list, node) {
-		if(node1->inode_no == inode_num) {
-			return node1;
+	list_for_each_entry(finfo, &mq->file_info_list, node) {
+		if(finfo->ino == inode_num) {
+			return finfo;
 		}
 	}
 
 	return NULL;
 }
 
-static unsigned long get_inode_from_bio(struct bio *bio) {
+static unsigned long get_ino(struct bio *bio) {
 	unsigned long inode = 0;
 	if(bio && bio->bi_io_vec && bio->bi_io_vec->bv_page)
 		if(!((uintptr_t)bio->bi_io_vec->bv_page->mapping & (uintptr_t)1))
@@ -841,9 +841,9 @@ static unsigned long get_inode_from_bio(struct bio *bio) {
 	return inode;
 }
 
-static struct block_to_inode_node *get_hlist_node_from_block(struct smq_policy *mq , dm_oblock_t oblock) {
+static struct blk_ino_pair *get_bipair_from_oblock(struct smq_policy *mq , dm_oblock_t oblock) {
 	//DEFINE_HASHTABLE(block_to_inode, BLOCK_TO_INODE_BITS);
-	struct block_to_inode_node *bi_node;
+	struct blk_ino_pair *bi_node;
 	//hash_for_each_possible(hlist, bi_node, hnode, oblock)
 	hash_for_each_possible(mq->block_to_inode, bi_node, node, oblock)
 		if(bi_node->block == oblock)
@@ -876,13 +876,13 @@ char *trimwhitespace(char *str)
 
   return str;
 }
-static ssize_t fifo_write(struct file *file, const char __user *buf,
+static ssize_t proc_file_track_write(struct file *file, const char __user *buf,
 						size_t count, loff_t *ppos)
 {
 	char filename[800];
 	char *filename_trimmed = NULL;
 	int duplecate_request = 0;
-	struct file_track_list_node *node1 = NULL;
+	struct file_info *node1 = NULL;
 
     //struct path path;
 
@@ -895,7 +895,7 @@ static ssize_t fifo_write(struct file *file, const char __user *buf,
 
 	printk(KERN_ERR "writing to file : %s\n", filename_trimmed);
 
-	list_for_each_entry(node1, &global_smq->file_track_list, node) {
+	list_for_each_entry(node1, &global_smq->file_info_list, node) {
 		if(strcmp(node1->filename,filename_trimmed) == 0) {
 			printk(KERN_ERR "File exists %s\n", filename_trimmed);
 			duplecate_request = 1;
@@ -908,13 +908,13 @@ static ssize_t fifo_write(struct file *file, const char __user *buf,
 	    //path_lookup(filename_trimmed, LOOKUP_FOLLOW, &nd);
 	    //inode = nd.inode;
 
-		node1 = (struct file_track_list_node *) kmalloc(sizeof(struct file_track_list_node), GFP_KERNEL);
+		node1 = (struct file_info *) kmalloc(sizeof(struct file_info), GFP_KERNEL);
 		strcpy(node1->filename, filename_trimmed);
 		node1->cache_block_count = 0;
 		//node1->inode_no = path.dentry->d_inode->i_ino;
-		sscanf(filename, "%lu", &node1->inode_no);
+		sscanf(filename, "%lu", &node1->ino);
 		INIT_LIST_HEAD(&node1->node);
-		list_add(&node1->node, &global_smq->file_track_list);
+		list_add(&node1->node, &global_smq->file_info_list);
 		global_smq->file_track_nr++;
 		printk(KERN_ERR "Added to list %s\n", node1->filename);
 	}
@@ -926,19 +926,19 @@ static ssize_t fifo_write(struct file *file, const char __user *buf,
 
 #define ON 1
 #define OFF 0
-static ssize_t fifo_read(struct file *file, char __user *buf,
+static ssize_t proc_file_track_read(struct file *file, char __user *buf,
 						size_t count, loff_t *ppos)
 {
 	char filenames[800] = "";
-	struct file_track_list_node *node1 = NULL;
+	struct file_info *node1 = NULL;
 	static int alternate = ON;
 
 	if (alternate%2 == ON) {
 		if (mutex_lock_interruptible(&read_lock))
 			return -ERESTARTSYS;
 
-		list_for_each_entry(node1, &global_smq->file_track_list, node) {
-			sprintf(filenames+strlen(filenames), "inode:%lu\t", node1->inode_no);
+		list_for_each_entry(node1, &global_smq->file_info_list, node) {
+			sprintf(filenames+strlen(filenames), "inode:%lu\t", node1->ino);
 			strcat(filenames, node1->filename);
 			strcat(filenames, "\n");
 		}
@@ -961,8 +961,8 @@ static ssize_t fifo_read(struct file *file, char __user *buf,
 
 static const struct file_operations fifo_reader_fops = {
 	.owner		= THIS_MODULE,
-	.read		= fifo_read,
-	.write		= fifo_write,
+	.read		= proc_file_track_read,
+	.write		= proc_file_track_write,
 	.llseek		= noop_llseek,
 };
 
@@ -981,14 +981,14 @@ struct entry *q_peek(struct queue *q, unsigned max_level, bool can_cross_sentine
 	for (level = 0; level < max_level; level++)
 		for (e = l_head(q->es, q->qs + level); e; e = l_next(q->es, e)) {
 			if(bio && mq) {
-				struct block_to_inode_node *bi_node = get_hlist_node_from_block(mq, e->oblock);
+				struct blk_ino_pair *bi_node = get_bipair_from_oblock(mq, e->oblock);
 				if(bi_node) {
-					unsigned long inode_no = bi_node->inode_num;
-					struct file_track_list_node *ftnode = get_file_track_list_node_from_inode(mq, inode_no);
+					unsigned long inode_no = bi_node->ino;
+					struct file_info *ftnode = get_finfo(mq, inode_no);
 					unsigned long cache_block_count = ftnode->cache_block_count;
 
-					if((mq->file_track_nr > 0 && cache_block_count > mq->cache_size / mq->file_track_nr) || bi_node->inode_num == get_inode_from_bio(bio)) {
-						printk(KERN_ERR "Inside q_peek : inode : %lu\t  is eq %lu\n", get_inode_from_bio(bio), bi_node->inode_num);
+					if((mq->file_track_nr > 0 && cache_block_count > mq->cache_size / mq->file_track_nr) || bi_node->ino == get_ino(bio)) {
+						printk(KERN_ERR "Inside q_peek : inode : %lu\t  is eq %lu\n", get_ino(bio), bi_node->ino);
 					} else {
 						//printk(KERN_ERR "Inside q_peek CONTINUE : inode : %lu\t not eq %lu\n", get_inode_from_bio(bio), bi_node->inode_num);
 						continue;
@@ -1306,8 +1306,8 @@ static int demote_cblock(struct smq_policy *mq,
 			 struct policy_locker *locker,
 			 dm_oblock_t *oblock, struct bio *bio)
 {
-	struct block_to_inode_node *bi_node = NULL;
-	struct file_track_list_node *ftnode = NULL;
+	struct blk_ino_pair *bi_node = NULL;
+	struct file_info *ftnode = NULL;
 	struct entry *demoted = q_peek(&mq->clean, mq->clean.nr_levels, false, bio, mq);
 	if (!demoted)
 		/*
@@ -1330,13 +1330,13 @@ static int demote_cblock(struct smq_policy *mq,
 	free_entry(&mq->cache_alloc, demoted);
 
 	// Remove block inode mapping
-	bi_node = get_hlist_node_from_block(mq, demoted->oblock);
+	bi_node = get_bipair_from_oblock(mq, demoted->oblock);
 	if(bi_node) {
-		ftnode = get_file_track_list_node_from_inode(mq, bi_node->inode_num);
+		ftnode = get_finfo(mq, bi_node->ino);
 		if(ftnode) {
 			ftnode->cache_block_count--;
 		}
-		printk(KERN_ERR "Inside demote_cblock : inode : %lu\t->%lu\t\tREPLACE\n", get_inode_from_bio(bio), bi_node->inode_num);
+		printk(KERN_ERR "Inside demote_cblock : inode : %lu\t->%lu\t\tREPLACE\n", get_ino(bio), bi_node->ino);
 		hlist_del(&bi_node->node);
 		kfree(bi_node);
 	}
@@ -1379,8 +1379,8 @@ static void insert_in_cache(struct smq_policy *mq, dm_oblock_t oblock,
 {
 	int r;
 	struct entry *e;
-	struct block_to_inode_node *binode = NULL;
-	struct file_track_list_node *ftnode = NULL;
+	struct blk_ino_pair *binode = NULL;
+	struct file_info *ftnode = NULL;
 
 	//printk(KERN_ERR "Entered in insert_in_cache\n");
 
@@ -1407,9 +1407,9 @@ static void insert_in_cache(struct smq_policy *mq, dm_oblock_t oblock,
 
 	// Add block inode mapping
 	// TODO:: what if mem is not allocatd here below, would have allocated already
-	binode = get_hlist_node_from_block(mq, e->oblock);
+	binode = get_bipair_from_oblock(mq, e->oblock);
 	if(binode==NULL) {
-		binode = (struct block_to_inode_node *) kmalloc(sizeof(struct block_to_inode_node), GFP_KERNEL);
+		binode = (struct blk_ino_pair *) kmalloc(sizeof(struct blk_ino_pair), GFP_KERNEL);
 		if(!binode) {
 			printk(KERN_ERR "No memory available");
 			result->op = POLICY_MISS;
@@ -1421,10 +1421,10 @@ static void insert_in_cache(struct smq_policy *mq, dm_oblock_t oblock,
 		hash_add(mq->block_to_inode, &binode->node, oblock);
 	}
 	binode->block = oblock;
-	binode->inode_num = get_inode_from_bio(bio);
+	binode->ino = get_ino(bio);
 
 	// Increment cache count of corresponding file
-	ftnode = get_file_track_list_node_from_inode(mq, binode->inode_num);
+	ftnode = get_finfo(mq, binode->ino);
 	if(ftnode) {
 		ftnode->cache_block_count++;
 	}
@@ -1469,8 +1469,8 @@ static void insert_in_cache(struct smq_policy *mq, dm_oblock_t oblock,
 		//printk(KERN_ERR "NEW\t: Stats : part1 count : %llu \tpart2 count : %llu\n", mq->cache_stats.part1_count, mq->cache_stats.part2_count);
 		//printk(KERN_ERR "NEW\t: Inode: %lu\n", get_inode_from_bio(bio));
 
-		list_for_each_entry(ftnode, &mq->file_track_list, node) {
-			printk(KERN_ERR "New/Replace inode:%lu \t count:%lu \n", ftnode->inode_no, ftnode->cache_block_count);
+		list_for_each_entry(ftnode, &mq->file_info_list, node) {
+			printk(KERN_ERR "New/Replace inode:%lu \t count:%lu \n", ftnode->ino, ftnode->cache_block_count);
 		}
 		//printk(KERN_ERR "New/Replace \n", get_inode_from_bio(bio));
 
@@ -1537,14 +1537,14 @@ static int map(struct smq_policy *mq, struct bio *bio, dm_oblock_t oblock,
 	struct entry *e, *hs_e;
 	enum promote_result pr;
 	unsigned long inode_no;
-	struct file_track_list_node *ftnode;
+	struct file_info *finfo;
 
 	//printk(KERN_INFO "SMQ Map block : %llu\n", oblock);
 
-	inode_no = get_inode_from_bio(bio);
-	ftnode = get_file_track_list_node_from_inode(mq, inode_no);
+	inode_no = get_ino(bio);
+	finfo = get_finfo(mq, inode_no);
 
-	if(!ftnode || mq->file_track_nr <= 0 /* || ftnode->cache_block_count >= mq->cache_size / mq->file_track_nr*/) {
+	if(!finfo || mq->file_track_nr <= 0 /* || ftnode->cache_block_count >= mq->cache_size / mq->file_track_nr*/) {
 		//printk(KERN_INFO "BIO from inode 0\n");
 		result->op = POLICY_MISS;
 		return -EWOULDBLOCK;
@@ -1931,7 +1931,7 @@ static void init_policy_functions(struct smq_policy *mq, bool mimic_mq)
 	// Initialise inode list
 	hash_init(mq->block_to_inode);
 	mq->file_track_nr = 0;
-	INIT_LIST_HEAD(&mq->file_track_list);
+	INIT_LIST_HEAD(&mq->file_info_list);
 }
 
 static bool too_many_hotspot_blocks(sector_t origin_size,
