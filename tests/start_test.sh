@@ -12,8 +12,8 @@
 # 10G = 40960 blocks
 #RANGE=40960
 RANGE1=200000
-RANGE2=2000
-count=40
+RANGE2=1000
+count=10
 let "RANGE1 -= $count"
 let "RANGE2 -= $count"
 

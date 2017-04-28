@@ -851,6 +851,10 @@ static struct blk_ino_pair *get_bipair_from_oblock(struct smq_policy *mq , dm_ob
 
 	return NULL;
 }
+static inline unsigned long get_ino_from_block(struct smq_policy *mq , dm_oblock_t oblock){
+	struct blk_ino_pair *bipair = get_bipair_from_oblock(mq, oblock);
+	return bipair==NULL ? 0 : bipair->ino;
+}
 
 /* lock for procfs write access */
 static DEFINE_MUTEX(write_lock);
@@ -938,7 +942,7 @@ static ssize_t proc_file_track_read(struct file *file, char __user *buf,
 			return -ERESTARTSYS;
 
 		list_for_each_entry(node1, &global_smq->file_info_list, node) {
-			sprintf(filenames+strlen(filenames), "inode:%lu\t", node1->ino);
+			sprintf(filenames+strlen(filenames), "inode:%lu\tcount:%lu\t", node1->ino, node1->cache_block_count);
 			strcat(filenames, node1->filename);
 			strcat(filenames, "\n");
 		}
@@ -1319,6 +1323,21 @@ static void end_cache_period(struct smq_policy *mq)
 	}
 }
 
+static inline void print_stats(char op[]) {
+
+	char buff[500] = "";
+	char form[100]="";
+	struct file_info *finfo;
+
+	strcat(buff, op);
+	strcat(buff, "\tinode:count ");
+	list_for_each_entry(finfo, &global_smq->file_info_list, node) {
+		sprintf(form, "%4lu:%-4lu\t", finfo->ino, finfo->cache_block_count);
+		strcat(buff, form);
+	}
+	printk(KERN_ERR "%s\n", buff);
+}
+
 static int demote_cblock(struct smq_policy *mq,
 			 struct policy_locker *locker,
 			 dm_oblock_t *oblock, struct bio *bio)
@@ -1349,11 +1368,14 @@ static int demote_cblock(struct smq_policy *mq,
 	// Remove block inode mapping
 	bi_node = get_bipair_from_oblock(mq, demoted->oblock);
 	if(bi_node) {
+		char buff[500] = "";
+		sprintf(buff, "Replace %4lu->%-4lu ", get_ino(bio), bi_node->ino);
+		print_stats(buff);
+
 		ftnode = get_finfo(mq, bi_node->ino);
 		if(ftnode) {
 			ftnode->cache_block_count--;
 		}
-		printk(KERN_ERR "Inside demote_cblock : inode : %lu\t->%lu\t\tREPLACE\n", get_ino(bio), bi_node->ino);
 		hlist_del(&bi_node->node);
 		kfree(bi_node);
 	}
@@ -1450,20 +1472,14 @@ static void insert_in_cache(struct smq_policy *mq, dm_oblock_t oblock,
 
 	switch(result->op) {
 	char buff[500] = "";
-	char form[100]="";
 
 	case POLICY_MISS:
 		break;
 	case POLICY_REPLACE:
+		break;
 	case POLICY_NEW:
-
-		strcat(buff, KERN_ERR "New/Replace inode:count ");
-		list_for_each_entry(finfo, &mq->file_info_list, node) {
-			sprintf(form, "%lu:%lu\t", finfo->ino, finfo->cache_block_count);
-			strcat(buff, form);
-		}
-		strcat(buff, "\n");
-		printk(buff);
+		sprintf(buff, "New\t inode:%-4lu", binode->ino);
+		print_stats(buff);
 		break;
 	default:
 		printk(KERN_ERR "Inside insert_in_cache : %llu\tUNKNOWN:%d\n", oblock, result->op);
@@ -1528,13 +1544,10 @@ static int map(struct smq_policy *mq, struct bio *bio, dm_oblock_t oblock,
 	unsigned long inode_no;
 	struct file_info *finfo;
 
-	//printk(KERN_INFO "SMQ Map block : %llu\n", oblock);
-
 	inode_no = get_ino(bio);
 	finfo = get_finfo(mq, inode_no);
 
 	if(!finfo || mq->file_track_nr <= 0) {
-		//printk(KERN_INFO "BIO from inode 0\n");
 		result->op = POLICY_MISS;
 		return -EWOULDBLOCK;
 	}
@@ -1548,16 +1561,12 @@ static int map(struct smq_policy *mq, struct bio *bio, dm_oblock_t oblock,
 		requeue(mq, e);
 		result->op = POLICY_HIT;
 		result->cblock = infer_cblock(mq, e);
-
-		printk(KERN_INFO "MAP : POLICY_HIT : %llu==%u\n", oblock, result->cblock);
-
 	} else {
 		stats_miss(&mq->cache_stats);
 
 		pr = should_promote(mq, hs_e, bio, fast_promote);
 		if (pr == PROMOTE_NOT) {
 			result->op = POLICY_MISS;
-			//printk(KERN_INFO "MAP : PROMOTE_NOT : %llu\n", oblock);
 		}
 		else {
 			if (!can_migrate) {
