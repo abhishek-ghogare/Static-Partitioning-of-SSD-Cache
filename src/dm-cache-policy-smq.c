@@ -976,23 +976,42 @@ struct entry *q_peek(struct queue *q, unsigned max_level, bool can_cross_sentine
 	unsigned level;
 	struct entry *e;
 
+	unsigned long 		quota = 0;
+	unsigned long 		curr_ino = 0;
+	struct file_info *	curr_finfo = NULL;
+	unsigned long 		curr_cache_count = 0;
+
+	if (bio && mq) {
+		quota 				= mq->file_track_nr > 0 ? mq->cache_size / mq->file_track_nr : 0;
+		curr_ino 			= get_ino(bio);
+		curr_finfo 			= get_finfo(mq, curr_ino);
+		curr_cache_count 	= curr_finfo == NULL ? quota : curr_finfo->cache_block_count;
+
+		// No need to replace if usage is above allocated quota
+		if(curr_cache_count > quota)
+			return NULL;
+	}
+
 	max_level = min(max_level, q->nr_levels);
 
 	for (level = 0; level < max_level; level++)
 		for (e = l_head(q->es, q->qs + level); e; e = l_next(q->es, e)) {
 			if(bio && mq) {
-				struct blk_ino_pair *bi_node = get_bipair_from_oblock(mq, e->oblock);
-				if(bi_node) {
-					unsigned long inode_no = bi_node->ino;
-					struct file_info *ftnode = get_finfo(mq, inode_no);
-					unsigned long cache_block_count = ftnode->cache_block_count;
+				struct blk_ino_pair *	can_bipair 		= get_bipair_from_oblock(mq, e->oblock);
+				unsigned long 			can_ino 		= can_bipair == NULL 	? 0 	: can_bipair->ino;
+				struct file_info *		can_finfo 		= can_ino == 0 			? NULL 	: get_finfo(mq, can_ino);
+				unsigned long 			can_cache_count = can_finfo == NULL 	? quota	: can_finfo->cache_block_count;
 
-					if((mq->file_track_nr > 0 && cache_block_count > mq->cache_size / mq->file_track_nr) || bi_node->ino == get_ino(bio)) {
-						printk(KERN_ERR "Inside q_peek : inode : %lu\t  is eq %lu\n", get_ino(bio), bi_node->ino);
-					} else {
-						//printk(KERN_ERR "Inside q_peek CONTINUE : inode : %lu\t not eq %lu\n", get_inode_from_bio(bio), bi_node->inode_num);
-						continue;
-					}
+				if(can_ino == curr_ino) {
+					if (curr_cache_count >= quota)	// If curr quota is full
+						;// Do replace
+					else							// Skip this block if curr file quota is not full, hoping other file is using more that its quota
+						continue;// Do no replace
+				} else {
+					if (can_cache_count > quota)	// If can file usage is above quota, replace
+						;// Do replace
+					else							// Else spare the can block
+						continue;// Do not replace
 				}
 			}
 
@@ -1004,11 +1023,9 @@ struct entry *q_peek(struct queue *q, unsigned max_level, bool can_cross_sentine
 				}
 			}
 
-			//printk(KERN_ERR "Inside q_peek RETURN : inode : %lu\n", get_inode_from_bio(bio));
 			return e;
 		}
 
-	//printk(KERN_ERR "Inside q_peek RETURN NULL : inode : %lu\n", get_inode_from_bio(bio));
 	return NULL;
 }
 /*
@@ -1380,13 +1397,11 @@ static void insert_in_cache(struct smq_policy *mq, dm_oblock_t oblock,
 	int r;
 	struct entry *e;
 	struct blk_ino_pair *binode = NULL;
-	struct file_info *ftnode = NULL;
-
-	//printk(KERN_ERR "Entered in insert_in_cache\n");
+	struct file_info *finfo = NULL;
 
 	if (allocator_empty(&mq->cache_alloc)) {
 		result->op = POLICY_REPLACE;
-		//printk(KERN_ERR "Calling demote cblock \n");
+
 		r = demote_cblock(mq, locker, &result->old_oblock, bio);
 		if (r) {
 			result->op = POLICY_MISS;
@@ -1394,14 +1409,12 @@ static void insert_in_cache(struct smq_policy *mq, dm_oblock_t oblock,
 		}
 
 	} else {
-		//printk(KERN_ERR "Allocate NEW cache block\n");
 		result->op = POLICY_NEW;
 	}
 
 	e = alloc_entry(&mq->cache_alloc);
 	BUG_ON(!e);
 	e->oblock = oblock;
-
 
 
 
@@ -1415,8 +1428,6 @@ static void insert_in_cache(struct smq_policy *mq, dm_oblock_t oblock,
 			result->op = POLICY_MISS;
 			return;
 		}
-		//binode->block = oblock;
-		//binode->inode_num = get_inode_from_bio(bio);
 		INIT_HLIST_NODE(&binode->node);
 		hash_add(mq->block_to_inode, &binode->node, oblock);
 	}
@@ -1424,9 +1435,9 @@ static void insert_in_cache(struct smq_policy *mq, dm_oblock_t oblock,
 	binode->ino = get_ino(bio);
 
 	// Increment cache count of corresponding file
-	ftnode = get_finfo(mq, binode->ino);
-	if(ftnode) {
-		ftnode->cache_block_count++;
+	finfo = get_finfo(mq, binode->ino);
+	if(finfo) {
+		finfo->cache_block_count++;
 	}
 
 	if (pr == PROMOTE_TEMPORARY)
@@ -1437,43 +1448,22 @@ static void insert_in_cache(struct smq_policy *mq, dm_oblock_t oblock,
 	result->cblock = infer_cblock(mq, e);
 
 
-	//printk(KERN_ERR "PID:%d ", current->pid);
 	switch(result->op) {
+	char buff[500] = "";
+	char form[100]="";
+
 	case POLICY_MISS:
-		//printk(KERN_ERR "Inside insert_in_cache : %llu\tMISS\n", oblock);
 		break;
 	case POLICY_REPLACE:
-		//printk(KERN_ERR "Inside insert_in_cache : %llu\tREPLACE\n", oblock);
-		/*if(oblock < 102400)
-			mq->cache_stats.part1_count++;
-		else
-			mq->cache_stats.part2_count++;
+	case POLICY_NEW:
 
-		if(result->old_oblock < 102400)
-			mq->cache_stats.part1_count--;
-		else
-			mq->cache_stats.part2_count--;*/
-
-		//printk(KERN_ERR "Inside insert_in_cache : %llu\tREPLACE \t Stats : part1 count : %llu \tpart2 count : %llu\n", oblock, mq->cache_stats.part1_count, mq->cache_stats.part2_count);
-
-		//printk(KERN_ERR "REPLACE\t: Inode: %lu\n", get_inode_from_bio(bio));
-
-		//break;
-	case POLICY_NEW:/*
-		printk(KERN_ERR "Inside insert_in_cache : %llu\tNEW\n", oblock);
-		if(oblock < 102400)
-			mq->cache_stats.part1_count++;
-		else
-			mq->cache_stats.part2_count++;
-*/
-		//printk(KERN_ERR "NEW\t: Stats : part1 count : %llu \tpart2 count : %llu\n", mq->cache_stats.part1_count, mq->cache_stats.part2_count);
-		//printk(KERN_ERR "NEW\t: Inode: %lu\n", get_inode_from_bio(bio));
-
-		list_for_each_entry(ftnode, &mq->file_info_list, node) {
-			printk(KERN_ERR "New/Replace inode:%lu \t count:%lu \n", ftnode->ino, ftnode->cache_block_count);
+		strcat(buff, KERN_ERR "New/Replace inode:count ");
+		list_for_each_entry(finfo, &mq->file_info_list, node) {
+			sprintf(form, "%lu:%lu\t", finfo->ino, finfo->cache_block_count);
+			strcat(buff, form);
 		}
-		//printk(KERN_ERR "New/Replace \n", get_inode_from_bio(bio));
-
+		strcat(buff, "\n");
+		printk(buff);
 		break;
 	default:
 		printk(KERN_ERR "Inside insert_in_cache : %llu\tUNKNOWN:%d\n", oblock, result->op);
@@ -1513,7 +1503,6 @@ static struct entry *update_hotspot_queue(struct smq_policy *mq, dm_oblock_t b, 
 				hi = get_index(&mq->hotspot_alloc, e);
 				clear_bit(hi, mq->hotspot_hit_bits);
 			}
-
 		}
 
 		if (e) {
@@ -1544,7 +1533,7 @@ static int map(struct smq_policy *mq, struct bio *bio, dm_oblock_t oblock,
 	inode_no = get_ino(bio);
 	finfo = get_finfo(mq, inode_no);
 
-	if(!finfo || mq->file_track_nr <= 0 /* || ftnode->cache_block_count >= mq->cache_size / mq->file_track_nr*/) {
+	if(!finfo || mq->file_track_nr <= 0) {
 		//printk(KERN_INFO "BIO from inode 0\n");
 		result->op = POLICY_MISS;
 		return -EWOULDBLOCK;
