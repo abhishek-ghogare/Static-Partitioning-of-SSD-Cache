@@ -1,0 +1,598 @@
+--- linux-4.9/drivers/md/dm-cache-policy-smq.c	2016-12-12 00:47:54.000000000 +0530
++++ ../linux-4.9/drivers/md/dm-cache-policy-smq.c	2017-04-28 12:07:22.546898014 +0530
+@@ -15,6 +15,15 @@
+ #include <linux/vmalloc.h>
+ #include <linux/math64.h>
+ 
++#include <linux/proc_fs.h>
++#include <linux/string.h>
++#include <linux/uaccess.h>
++#include <linux/ctype.h>
++#include <linux/path.h>
++#include <linux/namei.h>
++#include <linux/fs.h>
++#include <linux/namei.h>
++
+ #define DM_MSG_PREFIX "cache-policy-smq"
+ 
+ /*----------------------------------------------------------------*/
+@@ -300,53 +309,6 @@
+ 		q->nr_elts--;
+ }
+ 
+-/*
+- * Return the oldest entry of the lowest populated level.
+- */
+-static struct entry *q_peek(struct queue *q, unsigned max_level, bool can_cross_sentinel)
+-{
+-	unsigned level;
+-	struct entry *e;
+-
+-	max_level = min(max_level, q->nr_levels);
+-
+-	for (level = 0; level < max_level; level++)
+-		for (e = l_head(q->es, q->qs + level); e; e = l_next(q->es, e)) {
+-			if (e->sentinel) {
+-				if (can_cross_sentinel)
+-					continue;
+-				else
+-					break;
+-			}
+-
+-			return e;
+-		}
+-
+-	return NULL;
+-}
+-
+-static struct entry *q_pop(struct queue *q)
+-{
+-	struct entry *e = q_peek(q, q->nr_levels, true);
+-
+-	if (e)
+-		q_del(q, e);
+-
+-	return e;
+-}
+-
+-/*
+- * Pops an entry from a level that is not past a sentinel.
+- */
+-static struct entry *q_pop_old(struct queue *q, unsigned max_level)
+-{
+-	struct entry *e = q_peek(q, max_level, false);
+-
+-	if (e)
+-		q_del(q, e);
+-
+-	return e;
+-}
+ 
+ /*
+  * This function assumes there is a non-sentinel entry to pop.  It's only
+@@ -757,6 +719,24 @@
+ 	return __get_entry(ea->es, ea->begin + index);
+ }
+ 
++
++/*----------------------------------------------------------------*/
++
++#define BLOCK_TO_INODE_BITS 10
++struct blk_ino_pair {
++	dm_oblock_t block;
++	long unsigned int ino;
++
++	struct hlist_node node;
++};
++struct file_info {
++	char filename[200];
++	unsigned long ino;
++	unsigned long cache_block_count;
++
++	struct list_head node;
++};
++
+ /*----------------------------------------------------------------*/
+ 
+ #define NR_HOTSPOT_LEVELS 64u
+@@ -801,6 +781,12 @@
+ 	struct queue clean;
+ 	struct queue dirty;
+ 
++	struct list_head file_info_list;
++	int file_track_nr;
++	DECLARE_HASHTABLE(block_to_inode, BLOCK_TO_INODE_BITS);
++
++
++
+ 	struct stats hotspot_stats;
+ 	struct stats cache_stats;
+ 
+@@ -830,6 +816,248 @@
+ 	unsigned long next_cache_period;
+ };
+ 
++struct smq_policy *global_smq = NULL;
++
++/*----------------------------------------------------------------*/
++struct file_info * get_finfo(struct smq_policy *mq, unsigned long inode_num) {
++    struct file_info *finfo;
++
++	list_for_each_entry(finfo, &mq->file_info_list, node) {
++		if(finfo->ino == inode_num) {
++			return finfo;
++		}
++	}
++
++	return NULL;
++}
++
++static unsigned long get_ino(struct bio *bio) {
++	unsigned long inode = 0;
++	if(bio && bio->bi_io_vec && bio->bi_io_vec->bv_page)
++		if(!((uintptr_t)bio->bi_io_vec->bv_page->mapping & (uintptr_t)1))
++			if(bio->bi_io_vec->bv_page->mapping && bio->bi_io_vec->bv_page->mapping->host)
++				inode = bio->bi_io_vec->bv_page->mapping->host->i_ino;
++
++	return inode;
++}
++
++static struct blk_ino_pair *get_bipair_from_oblock(struct smq_policy *mq , dm_oblock_t oblock) {
++	//DEFINE_HASHTABLE(block_to_inode, BLOCK_TO_INODE_BITS);
++	struct blk_ino_pair *bi_node;
++	//hash_for_each_possible(hlist, bi_node, hnode, oblock)
++	hash_for_each_possible(mq->block_to_inode, bi_node, node, oblock)
++		if(bi_node->block == oblock)
++			return bi_node;
++
++	return NULL;
++}
++static inline unsigned long get_ino_from_block(struct smq_policy *mq , dm_oblock_t oblock){
++	struct blk_ino_pair *bipair = get_bipair_from_oblock(mq, oblock);
++	return bipair==NULL ? 0 : bipair->ino;
++}
++
++/* lock for procfs write access */
++static DEFINE_MUTEX(write_lock);
++/* lock for procfs read access */
++static DEFINE_MUTEX(read_lock);
++
++char *trimwhitespace(char *str)
++{
++  char *end;
++
++  // Trim leading space
++  while(isspace((unsigned char)*str)) str++;
++
++  if(*str == 0)  // All spaces?
++    return str;
++
++  // Trim trailing space
++  end = str + strlen(str) - 1;
++  while(end > str && isspace((unsigned char)*end)) end--;
++
++  // Write new null terminator
++  *(end+1) = 0;
++
++  return str;
++}
++static ssize_t proc_file_track_write(struct file *file, const char __user *buf,
++						size_t count, loff_t *ppos)
++{
++	char filename[800];
++	char *filename_trimmed = NULL;
++	int duplecate_request = 0;
++	struct file_info *node1 = NULL;
++
++    //struct path path;
++
++	if (mutex_lock_interruptible(&write_lock))
++		return -ERESTARTSYS;
++
++	copy_from_user(filename, buf, count);
++	filename[count] = '\0';
++	filename_trimmed = trimwhitespace(filename);
++
++	printk(KERN_ERR "writing to file : %s\n", filename_trimmed);
++
++	list_for_each_entry(node1, &global_smq->file_info_list, node) {
++		if(strcmp(node1->filename,filename_trimmed) == 0) {
++			printk(KERN_ERR "File exists %s\n", filename_trimmed);
++			duplecate_request = 1;
++			break;
++		}
++	}
++
++	if(!duplecate_request) {
++	    //kern_path(filename_trimmed, LOOKUP_FOLLOW, &path);
++	    //path_lookup(filename_trimmed, LOOKUP_FOLLOW, &nd);
++	    //inode = nd.inode;
++
++		node1 = (struct file_info *) kmalloc(sizeof(struct file_info), GFP_KERNEL);
++		strcpy(node1->filename, filename_trimmed);
++		node1->cache_block_count = 0;
++		//node1->inode_no = path.dentry->d_inode->i_ino;
++		sscanf(filename, "%lu", &node1->ino);
++		INIT_LIST_HEAD(&node1->node);
++		list_add(&node1->node, &global_smq->file_info_list);
++		global_smq->file_track_nr++;
++		printk(KERN_ERR "Added to list %s\n", node1->filename);
++	}
++
++	mutex_unlock(&write_lock);
++
++	return count;
++}
++
++#define ON 1
++#define OFF 0
++static ssize_t proc_file_track_read(struct file *file, char __user *buf,
++						size_t count, loff_t *ppos)
++{
++	char filenames[800] = "";
++	struct file_info *node1 = NULL;
++	static int alternate = ON;
++
++	if (alternate%2 == ON) {
++		if (mutex_lock_interruptible(&read_lock))
++			return -ERESTARTSYS;
++
++		list_for_each_entry(node1, &global_smq->file_info_list, node) {
++			sprintf(filenames+strlen(filenames), "inode:%lu\tcount:%lu\t", node1->ino, node1->cache_block_count);
++			strcat(filenames, node1->filename);
++			strcat(filenames, "\n");
++		}
++
++		printk(KERN_ERR "All reading from file : %s\n", filenames);
++
++		copy_to_user(buf, filenames, strlen(filenames));
++
++		mutex_unlock(&read_lock);
++
++		alternate = OFF;
++
++		return strlen(filenames);
++	}
++	else {
++		alternate = ON;
++		return 0;
++	}
++}
++
++static const struct file_operations fifo_reader_fops = {
++	.owner		= THIS_MODULE,
++	.read		= proc_file_track_read,
++	.write		= proc_file_track_write,
++	.llseek		= noop_llseek,
++};
++
++
++
++/*
++ * Return the oldest entry of the lowest populated level.
++ */
++struct entry *q_peek(struct queue *q, unsigned max_level, bool can_cross_sentinel, struct bio *bio, struct smq_policy *mq)
++{
++	unsigned level;
++	struct entry *e;
++
++	unsigned long 		quota = 0;
++	unsigned long 		curr_ino = 0;
++	struct file_info *	curr_finfo = NULL;
++	unsigned long 		curr_cache_count = 0;
++
++	if (bio && mq) {
++		quota 				= mq->file_track_nr > 0 ? mq->cache_size / mq->file_track_nr : 0;
++		curr_ino 			= get_ino(bio);
++		curr_finfo 			= get_finfo(mq, curr_ino);
++		curr_cache_count 	= curr_finfo == NULL ? quota : curr_finfo->cache_block_count;
++
++		// No need to replace if usage is above allocated quota
++		if(curr_cache_count > quota)
++			return NULL;
++	}
++
++	max_level = min(max_level, q->nr_levels);
++
++	for (level = 0; level < max_level; level++)
++		for (e = l_head(q->es, q->qs + level); e; e = l_next(q->es, e)) {
++			if(bio && mq) {
++				struct blk_ino_pair *	can_bipair 		= get_bipair_from_oblock(mq, e->oblock);
++				unsigned long 			can_ino 		= can_bipair == NULL 	? 0 	: can_bipair->ino;
++				struct file_info *		can_finfo 		= can_ino == 0 			? NULL 	: get_finfo(mq, can_ino);
++				unsigned long 			can_cache_count = can_finfo == NULL 	? quota	: can_finfo->cache_block_count;
++
++				if(can_ino == curr_ino) {
++					if (curr_cache_count >= quota)	// If curr quota is full
++						;// Do replace
++					else							// Skip this block if curr file quota is not full, hoping other file is using more that its quota
++						continue;// Do no replace
++				} else {
++					if (can_cache_count > quota)	// If can file usage is above quota, replace
++						;// Do replace
++					else							// Else spare the can block
++						continue;// Do not replace
++				}
++			}
++
++			if (e->sentinel) {
++				if (can_cross_sentinel)
++					continue;
++				else {
++					break;
++				}
++			}
++
++			return e;
++		}
++
++	return NULL;
++}
++/*
++*****
++struct entry *q_peek(struct queue *q, unsigned max_level, bool can_cross_sentinel, struct bio *bio, struct smq_policy *mq);
++******/
++static struct entry *q_pop(struct queue *q)
++{
++	struct entry *e = q_peek(q, q->nr_levels, true, NULL, NULL);
++
++	if (e)
++		q_del(q, e);
++
++	return e;
++}
++
++/*
++ * Pops an entry from a level that is not past a sentinel.
++ */
++static struct entry *q_pop_old(struct queue *q, unsigned max_level)
++{
++	struct entry *e = q_peek(q, max_level, false, NULL, NULL);
++
++	if (e)
++		q_del(q, e);
++
++	return e;
++}
+ /*----------------------------------------------------------------*/
+ 
+ static struct entry *get_sentinel(struct entry_alloc *ea, unsigned level, bool which)
+@@ -1095,11 +1323,28 @@
+ 	}
+ }
+ 
++static inline void print_stats(char op[]) {
++
++	char buff[500] = "";
++	char form[100]="";
++	struct file_info *finfo;
++
++	strcat(buff, op);
++	strcat(buff, "\tinode:count ");
++	list_for_each_entry(finfo, &global_smq->file_info_list, node) {
++		sprintf(form, "%4lu:%-4lu\t", finfo->ino, finfo->cache_block_count);
++		strcat(buff, form);
++	}
++	printk(KERN_ERR "%s\n", buff);
++}
++
+ static int demote_cblock(struct smq_policy *mq,
+ 			 struct policy_locker *locker,
+-			 dm_oblock_t *oblock)
++			 dm_oblock_t *oblock, struct bio *bio)
+ {
+-	struct entry *demoted = q_peek(&mq->clean, mq->clean.nr_levels, false);
++	struct blk_ino_pair *bi_node = NULL;
++	struct file_info *ftnode = NULL;
++	struct entry *demoted = q_peek(&mq->clean, mq->clean.nr_levels, false, bio, mq);
+ 	if (!demoted)
+ 		/*
+ 		 * We could get a block from mq->dirty, but that
+@@ -1120,6 +1365,21 @@
+ 	*oblock = demoted->oblock;
+ 	free_entry(&mq->cache_alloc, demoted);
+ 
++	// Remove block inode mapping
++	bi_node = get_bipair_from_oblock(mq, demoted->oblock);
++	if(bi_node) {
++		char buff[500] = "";
++		sprintf(buff, "Replace %4lu->%-4lu ", get_ino(bio), bi_node->ino);
++		print_stats(buff);
++
++		ftnode = get_finfo(mq, bi_node->ino);
++		if(ftnode) {
++			ftnode->cache_block_count--;
++		}
++		hlist_del(&bi_node->node);
++		kfree(bi_node);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1140,6 +1400,8 @@
+ static enum promote_result should_promote(struct smq_policy *mq, struct entry *hs_e, struct bio *bio,
+ 					  bool fast_promote)
+ {
++	return PROMOTE_PERMANENT;
++
+ 	if (bio_data_dir(bio) == WRITE) {
+ 		if (!allocator_empty(&mq->cache_alloc) && fast_promote)
+ 			return PROMOTE_TEMPORARY;
+@@ -1152,32 +1414,77 @@
+ 
+ static void insert_in_cache(struct smq_policy *mq, dm_oblock_t oblock,
+ 			    struct policy_locker *locker,
+-			    struct policy_result *result, enum promote_result pr)
++			    struct policy_result *result, enum promote_result pr, struct bio *bio)
+ {
+ 	int r;
+ 	struct entry *e;
++	struct blk_ino_pair *binode = NULL;
++	struct file_info *finfo = NULL;
+ 
+ 	if (allocator_empty(&mq->cache_alloc)) {
+ 		result->op = POLICY_REPLACE;
+-		r = demote_cblock(mq, locker, &result->old_oblock);
++
++		r = demote_cblock(mq, locker, &result->old_oblock, bio);
+ 		if (r) {
+ 			result->op = POLICY_MISS;
+ 			return;
+ 		}
+ 
+-	} else
++	} else {
+ 		result->op = POLICY_NEW;
++	}
+ 
+ 	e = alloc_entry(&mq->cache_alloc);
+ 	BUG_ON(!e);
+ 	e->oblock = oblock;
+ 
++
++
++	// Add block inode mapping
++	// TODO:: what if mem is not allocatd here below, would have allocated already
++	binode = get_bipair_from_oblock(mq, e->oblock);
++	if(binode==NULL) {
++		binode = (struct blk_ino_pair *) kmalloc(sizeof(struct blk_ino_pair), GFP_KERNEL);
++		if(!binode) {
++			printk(KERN_ERR "No memory available");
++			result->op = POLICY_MISS;
++			return;
++		}
++		INIT_HLIST_NODE(&binode->node);
++		hash_add(mq->block_to_inode, &binode->node, oblock);
++	}
++	binode->block = oblock;
++	binode->ino = get_ino(bio);
++
++	// Increment cache count of corresponding file
++	finfo = get_finfo(mq, binode->ino);
++	if(finfo) {
++		finfo->cache_block_count++;
++	}
++
+ 	if (pr == PROMOTE_TEMPORARY)
+ 		push(mq, e);
+ 	else
+ 		push_new(mq, e);
+ 
+ 	result->cblock = infer_cblock(mq, e);
++
++
++	switch(result->op) {
++	char buff[500] = "";
++
++	case POLICY_MISS:
++		break;
++	case POLICY_REPLACE:
++		break;
++	case POLICY_NEW:
++		sprintf(buff, "New\t inode:%-4lu", binode->ino);
++		print_stats(buff);
++		break;
++	default:
++		printk(KERN_ERR "Inside insert_in_cache : %llu\tUNKNOWN:%d\n", oblock, result->op);
++		break;
++	}
+ }
+ 
+ static dm_oblock_t to_hblock(struct smq_policy *mq, dm_oblock_t b)
+@@ -1212,7 +1519,6 @@
+ 				hi = get_index(&mq->hotspot_alloc, e);
+ 				clear_bit(hi, mq->hotspot_hit_bits);
+ 			}
+-
+ 		}
+ 
+ 		if (e) {
+@@ -1235,6 +1541,16 @@
+ {
+ 	struct entry *e, *hs_e;
+ 	enum promote_result pr;
++	unsigned long inode_no;
++	struct file_info *finfo;
++
++	inode_no = get_ino(bio);
++	finfo = get_finfo(mq, inode_no);
++
++	if(!finfo || mq->file_track_nr <= 0) {
++		result->op = POLICY_MISS;
++		return -EWOULDBLOCK;
++	}
+ 
+ 	hs_e = update_hotspot_queue(mq, oblock, bio);
+ 
+@@ -1245,24 +1561,26 @@
+ 		requeue(mq, e);
+ 		result->op = POLICY_HIT;
+ 		result->cblock = infer_cblock(mq, e);
+-
+ 	} else {
+ 		stats_miss(&mq->cache_stats);
+ 
+ 		pr = should_promote(mq, hs_e, bio, fast_promote);
+-		if (pr == PROMOTE_NOT)
++		if (pr == PROMOTE_NOT) {
+ 			result->op = POLICY_MISS;
+-
++		}
+ 		else {
+ 			if (!can_migrate) {
+ 				result->op = POLICY_MISS;
+ 				return -EWOULDBLOCK;
+ 			}
+ 
+-			insert_in_cache(mq, oblock, locker, result, pr);
++			insert_in_cache(mq, oblock, locker, result, pr, bio);
+ 		}
++
+ 	}
+ 
++
++
+ 	return 0;
+ }
+ 
+@@ -1607,6 +1925,11 @@
+ 		mq->policy.set_config_value = mq_set_config_value;
+ 		mq->policy.emit_config_values = mq_emit_config_values;
+ 	}
++
++	// Initialise inode list
++	hash_init(mq->block_to_inode);
++	mq->file_track_nr = 0;
++	INIT_LIST_HEAD(&mq->file_info_list);
+ }
+ 
+ static bool too_many_hotspot_blocks(sector_t origin_size,
+@@ -1715,6 +2038,8 @@
+ 	mq->next_hotspot_period = jiffies;
+ 	mq->next_cache_period = jiffies;
+ 
++	global_smq = mq;
++
+ 	return &mq->policy;
+ 
+ bad_alloc_hotspot_table:
+@@ -1797,6 +2122,10 @@
+ 		return -ENOMEM;
+ 	}
+ 
++	if (proc_create("smqp_file_track_list", 0, NULL, &fifo_reader_fops) == NULL) {
++		return -ENOMEM;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1805,6 +2134,7 @@
+ 	dm_cache_policy_unregister(&smq_policy_type);
+ 	dm_cache_policy_unregister(&mq_policy_type);
+ 	dm_cache_policy_unregister(&default_policy_type);
++	remove_proc_entry("smqp_file_track_list", NULL);
+ }
+ 
+ module_init(smq_init);
